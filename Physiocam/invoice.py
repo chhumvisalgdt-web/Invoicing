@@ -4,6 +4,9 @@ Page 1 is the original page, untouched.
 Page 2 is the same page with the "Total:" row replaced by
 Original Amount / Total for customer / Discount / Total, and everything
 below the table moved down to make room.
+
+Both invoice formats that pdftext.py reads work: CAMMED's mPDF files and
+invoices printed to PDF from a browser with the Adobe PDF printer.
 """
 
 import io
@@ -11,17 +14,19 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from functools import cache
 from pathlib import Path
 
 from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ContentStream, DecodedStreamObject, NameObject
+from pypdf.generic import DecodedStreamObject, NameObject
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+from pdftext import UNKNOWN, Rule, Run, page_rules, page_runs
 
 log = logging.getLogger(__name__)
 
@@ -65,16 +70,14 @@ def fixed_items() -> frozenset[str]:
 def is_fixed(desc: str) -> bool:
     return normalize(desc) in fixed_items()
 
-FONT_DIR = Path(__file__).parent / "fonts"
-BOLD = "DejaVuSerifCondensed-Bold"
-FONT_SIZE = 11
-pdfmetrics.registerFont(TTFont(BOLD, str(FONT_DIR / f"{BOLD}.ttf")))
 
-# Column boundaries of the mPDF invoice table (points from the left edge).
-COL_PRICE = 348.589
-COL_DISCOUNT = 399.538
-COL_TOTAL = 475.962
-LINE_WIDTH = 0.567
+# The mPDF invoices use DejaVu Serif Condensed; the printed ones Times New
+# Roman, for which the built-in Times-Bold has the same letter widths.
+FONT_DIR = Path(__file__).parent / "fonts"
+DEJAVU_BOLD = "DejaVuSerifCondensed-Bold"
+pdfmetrics.registerFont(TTFont(DEJAVU_BOLD, str(FONT_DIR / f"{DEJAVU_BOLD}.ttf")))
+
+FIELD = re.compile(r"^(Invoice N\S*|Customer|Sample N\S*|Doctor|Sampling Date|Issued date)\s*:\s*(.*)$")
 
 
 class InvoiceError(Exception):
@@ -94,17 +97,25 @@ class Item:
 
 @dataclass
 class Invoice:
-    fields: dict[str, str] = field(default_factory=dict)
-    items: list[Item] = field(default_factory=list)
-    total: Decimal = Decimal(0)
-    total_baseline: float = 0.0
-    total_label_x: float = 0.0  # where "Total:" starts
-    total_value_x: float = 0.0  # where " $xx.xx" starts
-    total_value_text: str = ""
+    fields: dict[str, str]
+    items: list[Item]
+    total: Decimal
+    label: Run  # "Total:" in the Total row
+    value: Run  # the amount in the Total row
+    top: Rule  # border above the Total row
+    bottom: Rule  # border below the Total row
+    left: Rule
+    divider: Rule  # between the label cell and the amount cell
+    right: Rule
+    footer_y: float = 0.0  # a browser page footer below this stays in place on page 2
+    page_number: Run | None = None  # the footer's "1/2"
 
 
 def money(s: str) -> Decimal:
-    return Decimal(s.replace("$", "").replace(",", "").strip())
+    try:
+        return Decimal(s.replace("$", "").replace(",", "").strip())
+    except InvalidOperation:
+        raise InvoiceError(f"can't read the amount {s!r}") from None
 
 
 def fmt(d: Decimal) -> str:
@@ -112,97 +123,120 @@ def fmt(d: Decimal) -> str:
 
 
 def cents(d: Decimal) -> Decimal:
-    return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    """Half a cent rounds to the even cent, as on the existing discount pages
+    (35% of $30.70 is $10.74, of $34.90 is $12.22)."""
+    return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 
 
-def _text_runs(page) -> list[tuple[float, float, str]]:
-    runs = []
-
-    def visit(text, cm, tm, _fd, _fs):
-        if text.strip():
-            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
-            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
-            runs.append((x, y, text))
-
-    page.extract_text(visitor_text=visit)
-    return runs
+def _lines(runs: list[Run]) -> list[tuple[float, list[Run]]]:
+    """Runs grouped by baseline, top to bottom, each line sorted left to right."""
+    lines: list[tuple[float, list[Run]]] = []
+    for run in sorted(runs, key=lambda r: -r.y):
+        if lines and abs(lines[-1][0] - run.y) < 1.0:
+            lines[-1][1].append(run)
+        else:
+            lines.append((run.y, [run]))
+    return [(y, sorted(line, key=lambda r: r.x0)) for y, line in lines]
 
 
-def parse(page) -> Invoice:
-    runs = _text_runs(page)
-    all_text = " ".join(t for _, _, t in runs)
-    if "INVOICE" not in all_text or "Invoice N" not in all_text:
-        raise NotAnInvoice("no INVOICE header")
-    if "Original Amount" in all_text:
+def _join(runs) -> str:
+    return " ".join(" ".join(r.text for r in runs).split())
+
+
+def _verticals_at(rules: list[Rule], y: float) -> list[Rule]:
+    """Vertical borders crossing height y, left to right, one per position."""
+    found = sorted((r for r in rules if not r.horizontal and r.a - 0.5 <= y <= r.b + 0.5), key=lambda r: r.mid)
+    out: list[Rule] = []
+    for r in found:
+        if not out or r.mid - out[-1].mid > 2:
+            out.append(r)
+    return out
+
+
+def parse(runs: list[Run], rules: list[Rule]) -> Invoice:
+    text = _join(runs)
+    if "INVOICE" not in text or "Invoice N" not in text:
+        unreadable = text.count(UNKNOWN)
+        raise NotAnInvoice("no INVOICE header" + (f" ({unreadable} unreadable characters)" if unreadable else ""))
+    if "Original Amount" in text:
         raise NotAnInvoice("already converted")
 
-    inv = Invoice()
+    lines = _lines(runs)
 
-    # Header block: "Label" ... " :" ... " value" on the same baseline.
-    lines: dict[float, list[tuple[float, str]]] = {}
-    for x, y, t in runs:
-        lines.setdefault(round(y, 1), []).append((x, t))
-    for y in sorted(lines, reverse=True):
-        parts = [t for _, t in sorted(lines[y])]
-        joined = "".join(parts).strip()
-        m = re.match(r"^(Invoice N\S*|Customer|Sample N\S*|Doctor|Sampling Date|Issued date)\s*:\s*(.*)$", joined)
+    # Header block: "Label : value" lines.
+    fields: dict[str, str] = {}
+    for _, line in lines:
+        m = FIELD.match(_join(line))
         if m:
             key = m.group(1)
             key = "Invoice No" if key.startswith("Invoice") else "Sample No" if key.startswith("Sample") else key
-            inv.fields[key] = m.group(2).strip()
+            fields.setdefault(key, m.group(2).strip())
 
     # Table: rows between the column header and the "Total:" row.
-    header_y = next((y for x, y, t in runs if t.strip() == "Item#"), None)
-    total_run = next(((x, y) for x, y, t in runs if t.strip() == "Total:"), None)
-    if header_y is None or total_run is None:
+    header_y = next((y for y, line in lines if any(r.text.strip() == "Item#" for r in line)), None)
+    total = None
+    if header_y is not None:
+        total = next(((y, line) for y, line in lines
+                      if y < header_y and any(r.text.strip() == "Total:" for r in line)), None)
+    if total is None:
         raise InvoiceError("could not find the item table")
-    inv.total_label_x, inv.total_baseline = total_run
+    total_y, total_line = total
+    label = next(r for r in total_line if r.text.strip() == "Total:")
+    amount = [r for r in total_line if r.x0 > label.x0]
+    if not amount:
+        raise InvoiceError("could not read the invoice total")
 
-    for y in sorted(lines, reverse=True):
-        if not (inv.total_baseline + 1 < y < header_y - 1):
+    # Columns: Item# | Desc. | Price | Discount | Total, split by the header row's borders.
+    borders = _verticals_at(rules, header_y)
+    if len(borders) != 6:
+        raise InvoiceError(f"expected 5 table columns, found {len(borders) - 1}")
+    inner = borders[1:-1]
+    items: list[Item] = []
+    for y, line in lines:
+        if not total_y < y < header_y:
             continue
-        cells = sorted(lines[y])
-        no = "".join(t for x, t in cells if x < 90).strip()
-        desc = "".join(t for x, t in cells if 90 <= x < COL_PRICE).strip()
-        line_total = "".join(t for x, t in cells if x >= COL_TOTAL).strip()
+        cells = ["", "", "", "", ""]
+        for r in line:
+            col = sum(1 for b in inner if r.x0 > b.mid)
+            cells[col] += " " + r.text
+        no, desc, _, _, line_total = (" ".join(c.split()) for c in cells)
         if no:
             if not line_total:
                 raise InvoiceError(f"item {no} has no total")
-            inv.items.append(Item(no, desc, money(line_total)))
-        elif desc and inv.items:  # wrapped description line
-            inv.items[-1].desc += " " + desc
+            items.append(Item(no, desc, money(line_total)))
+        elif desc and items:  # wrapped description line
+            items[-1].desc += " " + desc
 
-    value = [(x, t) for x, y, t in runs if abs(y - inv.total_baseline) < 1 and x > COL_TOTAL]
-    if not value:
-        raise InvoiceError("could not read the invoice total")
-    inv.total_value_x, inv.total_value_text = value[0]
-    inv.total = money(inv.total_value_text)
+    # Borders around the Total row.
+    x = label.x0 + 1
+    across = [r for r in rules if r.horizontal and r.a - 0.5 <= x <= r.b + 0.5]
+    above = [r for r in across if r.mid > total_y]
+    below = [r for r in across if r.mid < total_y]
+    if not above or not below:
+        raise InvoiceError("could not find the Total row borders")
+    top, bottom = min(above, key=lambda r: r.mid), max(below, key=lambda r: r.mid)
+    verticals = _verticals_at(rules, (top.lo + bottom.hi) / 2)
+    dividers = [r for r in verticals if label.x0 < r.mid < amount[0].x0]
+    if len(verticals) < 3 or not dividers:
+        raise InvoiceError("could not find the Total row borders")
 
-    if not inv.items:
+    # A browser print has a page footer ("about:blank   1/2") that must not move.
+    footer = [r for r in runs if r.y < 40]
+    footer_y = max(r.y + r.size for r in footer) + 2 if footer else 0.0
+    page_number = next((r for r in footer if r.text == "1/2"), None)
+
+    inv = Invoice(
+        fields, items, money(_join(amount)), label, amount[-1], top, bottom,
+        verticals[0], dividers[-1], verticals[-1], footer_y, page_number,
+    )
+    if not items:
         raise InvoiceError("no items found")
-    item_sum = sum((i.total for i in inv.items), Decimal(0))
+    item_sum = sum((i.total for i in items), Decimal(0))
     if item_sum != inv.total:
         raise InvoiceError(f"items add up to {fmt(item_sum)} but invoice total is {fmt(inv.total)}")
-    if not inv.fields.get("Customer"):
+    if not fields.get("Customer"):
         raise InvoiceError("no customer name")
     return inv
-
-
-def _table_lines(page, reader) -> tuple[list[float], list[float]]:
-    """Return y of horizontal and x of vertical line segments drawn on the page."""
-    hs, vs = set(), set()
-    cur = None
-    for operands, op in ContentStream(page.get_contents(), reader).operations:
-        if op == b"m":
-            cur = tuple(float(v) for v in operands)
-        elif op == b"l" and cur:
-            x, y = (float(v) for v in operands)
-            if abs(y - cur[1]) < 0.01:
-                hs.add(round(y, 3))
-            elif abs(x - cur[0]) < 0.01:
-                vs.add(round(x, 3))
-            cur = (x, y)
-    return sorted(hs), sorted(vs)
 
 
 def discount_for(inv: Invoice) -> Decimal:
@@ -210,23 +244,44 @@ def discount_for(inv: Invoice) -> Decimal:
     return cents(discountable * DISCOUNT_RATE)
 
 
-def _summary_overlay(width, height, rows, top, row_h, left, right, label_right, value_right, baseline_off) -> bytes:
+def _font_for(run: Run) -> str:
+    if "DejaVu" in run.font:
+        return DEJAVU_BOLD
+    if "arial" in run.font.lower() or "helvetica" in run.font.lower():
+        return "Helvetica-Bold"
+    return "Times-Bold"
+
+
+def _summary_overlay(width: float, height: float, inv: Invoice, rows: list[tuple[str, str]]) -> bytes:
+    font, size = _font_for(inv.label), inv.label.size
+    label_right = inv.label.x1 if inv.label.x1 is not None else (
+        inv.label.x0 + pdfmetrics.stringWidth(inv.label.text.strip(), font, size))
+    # mPDF text has no known right edge: use the label cell's right padding.
+    value_right = inv.value.x1 if inv.value.x1 is not None else inv.right.lo - (inv.divider.lo - label_right)
+    row_h = inv.top.lo - inv.bottom.lo
+    bottom = inv.top.lo - len(rows) * row_h
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(width, height))
-    c.setLineWidth(LINE_WIDTH)
-    c.setStrokeColorRGB(0, 0, 0)
-    c.setFont(BOLD, FONT_SIZE)
+    c.setFillColorRGB(0, 0, 0)
+    for i in range(len(rows) + 1):
+        c.rect(inv.left.lo, inv.top.lo - i * row_h, inv.right.hi - inv.left.lo, inv.top.hi - inv.top.lo,
+               stroke=0, fill=1)
+    for v in (inv.left, inv.divider, inv.right):
+        c.rect(v.lo, bottom, v.hi - v.lo, inv.top.hi - bottom, stroke=0, fill=1)
+    c.setFont(font, size)
     for i, (label, value) in enumerate(rows):
-        y_top = top - i * row_h
-        y_bot = y_top - row_h
-        c.line(left, y_top, right, y_top)
-        c.line(left, y_bot, right, y_bot)
-        c.line(left, y_top, left, y_bot)
-        c.line(COL_TOTAL, y_top, COL_TOTAL, y_bot)
-        c.line(right, y_top, right, y_bot)
-        base = y_top - baseline_off
-        c.drawRightString(label_right, base, label)
-        c.drawRightString(value_right, base, value)
+        y = inv.label.y - i * row_h
+        c.drawRightString(label_right, y, label)
+        c.drawRightString(value_right, y, value)
+    if inv.page_number:  # browser footer: page "1/2" becomes "2/2"
+        r = inv.page_number
+        right = r.x1 if r.x1 is not None else r.x0 + 2 * r.size
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(r.x0 - 0.5, r.y - 0.3 * r.size, right - r.x0 + 1, 1.3 * r.size, stroke=0, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", r.size)
+        c.drawString(r.x0, r.y, "2/2")
     c.showPage()
     c.save()
     return buf.getvalue()
@@ -239,24 +294,11 @@ def generate(pdf_bytes: bytes) -> tuple[str, bytes]:
         page = reader.pages[0]
     except Exception as e:  # corrupt / encrypted / not a PDF
         raise NotAnInvoice(str(e)) from e
-    if any("Original Amount" in (p.extract_text() or "") for p in reader.pages[1:]):
+
+    # Page 1 first: lab reports stop here without reading their other pages.
+    inv = parse(page_runs(page, reader), page_rules(page, reader))
+    if any("Original Amount" in _join(page_runs(p, reader)) for p in reader.pages[1:]):
         raise NotAnInvoice("already converted")
-
-    inv = parse(page)
-
-    hs, vs = _table_lines(page, reader)
-    above = [y for y in hs if y > inv.total_baseline]
-    below = [y for y in hs if y < inv.total_baseline]
-    if not above or not below or not vs:
-        raise InvoiceError("could not find the table borders")
-    row_top, row_bot = min(above), max(below)
-    row_h = row_top - row_bot
-    left, right = min(vs), max(vs)
-    baseline_off = row_top - inv.total_baseline
-
-    label_right = inv.total_label_x + pdfmetrics.stringWidth("Total:", BOLD, FONT_SIZE)
-    # Same right padding inside the amount cell as inside the label cell.
-    value_right = right - (COL_TOTAL - label_right)
 
     discount = discount_for(inv)
     fixed = [i.desc for i in inv.items if is_fixed(i.desc)]
@@ -270,7 +312,7 @@ def generate(pdf_bytes: bytes) -> tuple[str, bytes]:
         ("Discount:", fmt(discount)),
         ("Total:", fmt(inv.total - discount)),
     ]
-    shift = (len(rows) - 1) * row_h
+    shift = (len(rows) - 1) * (inv.top.lo - inv.bottom.lo)
 
     width = float(page.mediabox.width)
     height = float(page.mediabox.height)
@@ -279,8 +321,8 @@ def generate(pdf_bytes: bytes) -> tuple[str, bytes]:
     writer = PdfWriter()
     page1 = writer.add_page(page)
 
-    # Page 2 draws the original content twice (clipped) and shares page 1's
-    # fonts and images, so the logo and QR code are stored only once.
+    # Page 2 draws the original content again in clipped parts and shares
+    # page 1's fonts and images, so the logo and QR code are stored only once.
     resources = page1["/Resources"]
     if not hasattr(resources, "idnum"):
         resources = writer._add_object(resources)
@@ -288,20 +330,21 @@ def generate(pdf_bytes: bytes) -> tuple[str, bytes]:
     page2 = writer.add_blank_page(width, height)
     page2[NameObject("/Resources")] = resources
     big = 10000
-    content = b"".join([
+    lower = inv.footer_y or -big
+    parts = [
         # Everything above the Total row, in place.
-        f"q 0 {row_top:.3f} {width:.3f} {big} re W n\n".encode(), original, b"\nQ\n",
-        # Everything below the Total row, moved down.
-        f"q 1 0 0 1 0 {-shift:.3f} cm 0 {-big} {width:.3f} {row_bot + big:.3f} re W n\n".encode(), original, b"\nQ\n",
-    ])
+        f"q 0 {inv.top.lo:.3f} {width:.3f} {big} re W n\n".encode(), original, b"\nQ\n",
+        # Everything below the Total row (down to any page footer), moved down.
+        f"q 1 0 0 1 0 {-shift:.3f} cm 0 {lower:.3f} {width:.3f} {inv.bottom.lo - lower:.3f} re W n\n".encode(),
+        original, b"\nQ\n",
+    ]
+    if inv.footer_y:  # the page footer, in place
+        parts += [f"q 0 {-big} {width:.3f} {inv.footer_y + big:.3f} re W n\n".encode(), original, b"\nQ\n"]
     stream = DecodedStreamObject()
-    stream.set_data(content)
+    stream.set_data(b"".join(parts))
     page2[NameObject("/Contents")] = writer._add_object(stream)
 
-    overlay = PdfReader(io.BytesIO(_summary_overlay(
-        width, height, rows, row_top, row_h, left, right, label_right, value_right, baseline_off,
-    ))).pages[0]
-    page2.merge_page(overlay)
+    page2.merge_page(PdfReader(io.BytesIO(_summary_overlay(width, height, inv, rows))).pages[0])
 
     out = io.BytesIO()
     writer.write(out)

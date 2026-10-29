@@ -7,7 +7,7 @@ import os
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
 from invoice import InvoiceError, NotAnInvoice, fixed_items, fixed_items_source, generate
 
@@ -18,6 +18,29 @@ log = logging.getLogger("bot")
 
 # Optional comma-separated list of chat ids the bot will answer in. Empty = any chat.
 ALLOWED_CHATS = {int(c) for c in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if c}
+
+# Some apps send PDFs as a generic file type, so also accept them by file name.
+PDF_FILES = (filters.Document.PDF | filters.Document.FileExtension("pdf")) & ~filters.UpdateType.EDITED
+
+
+async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One log line for everything the bot receives (never the message text),
+    so the log shows whether Telegram delivers the group's messages at all."""
+    chat, msg = update.effective_chat, update.effective_message
+    where = f"chat {chat.id} ({chat.type}{': ' + chat.title if chat.title else ''})" if chat else "no chat"
+    if msg and msg.document:
+        what = f"file {msg.document.file_name!r} ({msg.document.mime_type})"
+    elif msg:
+        what = "message"
+    else:
+        what = "update"
+    log.info("Received %s in %s", what, where)
+
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "✅ Bot is running. Send an original CAMMED invoice PDF and I'll reply with the discounted invoice."
+    )
 
 
 async def on_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -33,8 +56,8 @@ async def on_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         filename, out = generate(data)
-    except NotAnInvoice:
-        log.info("Skipping %s: not an original invoice", doc.file_name)
+    except NotAnInvoice as e:
+        log.info("Skipping %s: not an original invoice (%s)", doc.file_name, e)
         return
     except InvoiceError as e:
         log.warning("Could not process %s: %s", doc.file_name, e)
@@ -45,11 +68,22 @@ async def on_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_document(document=io.BytesIO(out), filename=filename)
 
 
+async def on_startup(app: Application) -> None:
+    log.info("Logged in as @%s (id %s)", app.bot.username, app.bot.id)
+
+
+def build_app(token: str) -> Application:
+    app = Application.builder().token(token).post_init(on_startup).build()
+    app.add_handler(TypeHandler(Update, log_update), group=-1)
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(MessageHandler(PDF_FILES, on_pdf))
+    return app
+
+
 def main() -> None:
     token = os.environ["BOT_TOKEN"]
     log.info("%d fixed-price tests loaded from %s", len(fixed_items()), fixed_items_source())
-    app = Application.builder().token(token).build()
-    app.add_handler(MessageHandler(filters.Document.PDF, on_pdf))
+    app = build_app(token)
     log.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
